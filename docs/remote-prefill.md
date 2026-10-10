@@ -120,5 +120,18 @@ whatever the local prefix cache restored, instead of appending to it:
   recurrent state, and the PLE layer its conv state and the prompt's last
   tokens as n-gram context.
 - Single-rank producers only. Run vLLM as the kv-handoff doc describes
-  (`--max-num-seqs 1`, no prefix caching, bf16 KV) and keep MTP off for this
-  model here, since the handoff carries no MTP-head cache.
+  (`--max-num-seqs 1`, no prefix caching, bf16 KV).
+
+With Lightning MTP on (`mtp_enabled`), the MTP head needs the prompt in its own
+cache. Prompt priming normally builds it from the hidden states of a local
+prefill. A vLLM producer started with `--speculative-config
+'{"method":"mtp","num_speculative_tokens":1}'` caches the same history in its
+drafter. The handoff then adds `mtp` entries:
+- the head layer's keys, values and raw index keys for pairs `0 .. T-2`;
+- the trunk hidden streams of token `T-1`.
+
+oMLX resumes priming from them at the handoff's boundary, the way it resumes
+from a prefix-cache sidecar. Without them, the head sees only the generation
+prompt. That costs little on prose but much on answers that copy from the
+prompt: in a code-rewrite test, unprimed drafting reached 88 tok/s against
+120 primed.

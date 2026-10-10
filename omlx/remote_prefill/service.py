@@ -41,6 +41,27 @@ def _activation_dtype(mx: Any, model: Any) -> Any:
     return mx.bfloat16
 
 
+class _HandedOffMtp:
+    """A prefix cache whose MTP sidecar lookup returns one handoff's MTP-head history.
+
+    Prompt priming restores a sidecar at the backbone's cache boundary. A hybrid handoff sets that
+    boundary itself, so the handoff's history stands in for the sidecar; everything else, including
+    publishing new sidecars, goes to the real prefix cache."""
+
+    def __init__(self, base: Any, snapshot: Any) -> None:
+        self._base = base
+        self._snapshot = snapshot
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def restore_mtp_prefix_snapshot(self, tokens: list[int], boundary_tokens: int, **kwargs: Any) -> Any:
+        if int(boundary_tokens) == self._snapshot.boundary_tokens:
+            return self._snapshot
+        restore = getattr(self._base, "restore_mtp_prefix_snapshot", None)
+        return restore(tokens, boundary_tokens, **kwargs) if callable(restore) else None
+
+
 class RemotePrefill:
     """Decides which requests prefill on the vLLM server and hands their KV caches to the scheduler."""
 
@@ -64,6 +85,8 @@ class RemotePrefill:
         self._jobs: dict[str, PrefillJob] = {}
         # Requests whose remote prefill already ran; each request gets one at most.
         self._served: set[str] = set()
+        # MTP-head history from hybrid handoffs, until prompt priming takes it (prefix_cache_for).
+        self._mtp: dict[str, Any] = {}
         # One handoff uses the links at a time, whichever request it belongs to.
         self._links = threading.Lock()
         self._failures = 0
@@ -317,7 +340,35 @@ class RemotePrefill:
         request.prompt_cache = caches
         request.cached_tokens = job.end
         request.remaining_tokens = request.prompt_token_ids[job.end :]
+        self._keep_mtp(request, job)
         self._succeeded(job, 0)
+
+    def _keep_mtp(self, request: Any, job: PrefillJob) -> None:
+        """Hold the handoff's MTP-head history for prompt priming; without it the head primes locally."""
+        mx = self._mx
+        try:
+            built = hybrid.build_mtp(
+                mx,
+                self._scheduler.model,
+                self._hybrid,
+                job.result,
+                job.end,
+                _activation_dtype(mx, self._scheduler.model),
+            )
+        except Exception as exc:
+            logger.warning("Request %s: the MTP history could not be applied: %r", request.request_id, exc)
+            return
+        if built is None:
+            return
+        from ..patches.mlx_lm_mtp.prompt_priming import _MtpPrefixSnapshot
+
+        caches, hidden = built
+        self._mtp[request.request_id] = _MtpPrefixSnapshot(job.end, caches, hidden)
+
+    def prefix_cache_for(self, request: Any, prefix_cache: Any) -> Any:
+        """`prefix_cache`, or a view of it that restores this request's handed-off MTP history."""
+        snapshot = self._mtp.pop(request.request_id, None)
+        return prefix_cache if snapshot is None else _HandedOffMtp(prefix_cache, snapshot)
 
     def _succeeded(self, job: PrefillJob, cached: int) -> None:
         self._failures = 0
@@ -353,6 +404,7 @@ class RemotePrefill:
     def forget(self, request_id: str) -> None:
         """Stop and drop the remote prefill of a request that left the queue."""
         self._served.discard(request_id)
+        self._mtp.pop(request_id, None)
         job = self._jobs.pop(request_id, None)
         if job is not None:
             job.cancel()
@@ -363,6 +415,7 @@ class RemotePrefill:
             job.cancel()
         self._jobs.clear()
         self._served.clear()
+        self._mtp.clear()
 
     def status(self) -> dict[str, Any]:
         return {

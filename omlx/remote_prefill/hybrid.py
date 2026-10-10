@@ -12,6 +12,14 @@ prefix cache restored. Each tensor arrives as its own manifest entry in a fixed 
     gdn  conv        [conv_kernel - 1, conv_dim]       oldest tap first; channels q | k | v
     gdn  ssm         [v_heads, v_dim, k_dim]           float32
     ple  conv        [(kernel - 1) * dilation, hc_dim] oldest tap first
+    mtp  k, v        [T - 1, kv_heads, head_dim]       the MTP head's QSA layer (index = layers)
+    mtp  index_keys  [T - 1, indexer_head_dim]
+    mtp  hidden      [1, hc_dim]                       trunk hidden streams of token T - 1
+
+The mtp entries come only from a producer that runs MTP speculative decoding. Row t of the
+head's layer pairs the trunk's hidden state at t with token t + 1, exactly what Lightning MTP's
+prompt priming folds, so with the hidden state of token T - 1 pending they resume priming at
+`end` like a prefix-cache sidecar does. Without them the head starts on the local suffix only.
 
 Text-only prompts index positions 0..T-1, and the PLE layer's n-gram context is the prompt's
 last tokens, so neither crosses the link.
@@ -39,6 +47,7 @@ class HybridGeometry:
     ple_layer: int  # the layer that also carries PLE state, or -1
     shapes: dict[tuple[str, str], tuple[int, ...]]  # (kind, name) -> exported shape
     ple_context: int
+    mtp_layer: int = -1  # the MTP head's layer index when the local model drafts with it
 
     def expected(self) -> dict[tuple[int, str, str], tuple[int, ...]]:
         """Every entry a complete handoff carries, keyed by (layer, kind, name)."""
@@ -50,6 +59,13 @@ class HybridGeometry:
         if self.ple_layer >= 0:
             out[(self.ple_layer, "ple", "conv")] = self.shapes[("ple", "conv")]
         return out
+
+    def expected_mtp(self) -> dict[tuple[int, str, str], tuple[int, ...]]:
+        """The optional MTP-head entries; -1 rows means one fewer than the prompt."""
+        if self.mtp_layer < 0:
+            return {}
+        return {(self.mtp_layer, "mtp", name): self.shapes[("mtp", name)]
+                for name in ("k", "v", "index_keys", "hidden")}
 
 
 def _text_config(model: Any) -> Any:
@@ -63,6 +79,18 @@ def _text_config(model: Any) -> Any:
 
 def _get(config: Any, name: str) -> Any:
     return config.get(name) if isinstance(config, dict) else getattr(config, name, None)
+
+
+def _mtp_host(model: Any) -> Any:
+    """The model object Lightning MTP drafts with, or None when MTP is off."""
+    try:
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+    except Exception:
+        return None
+    if not prompt_priming.priming_enabled():
+        return None
+    host = prompt_priming._eligible_host(model)
+    return host if host is not None and callable(getattr(host, "make_mtp_cache", None)) else None
 
 
 def hybrid_geometry(model: Any, caches: list[Any]) -> tuple[HybridGeometry | None, str]:
@@ -107,8 +135,14 @@ def hybrid_geometry(model: Any, caches: list[Any]) -> tuple[HybridGeometry | Non
         if not (ple_kernel and dilation and hc_dim):
             return None, "the config lacks the PLE sizes"
         shapes[("ple", "conv")] = ((ple_kernel - 1) * dilation, hc_dim)
+    mtp_layer = len(caches) if hc_dim and _mtp_host(model) is not None else -1
+    if mtp_layer >= 0:
+        shapes[("mtp", "k")] = shapes[("qsa", "k")]
+        shapes[("mtp", "v")] = shapes[("qsa", "v")]
+        shapes[("mtp", "index_keys")] = shapes[("qsa", "index_keys")]
+        shapes[("mtp", "hidden")] = (1, hc_dim)
     return (
-        HybridGeometry(len(caches), tuple(kinds), ple_layer, shapes, max(0, (dilation or 1) - 1)),
+        HybridGeometry(len(caches), tuple(kinds), ple_layer, shapes, max(0, (dilation or 1) - 1), mtp_layer),
         "",
     )
 
@@ -120,8 +154,18 @@ def check_manifest(manifest: wire.Manifest, geometry: HybridGeometry) -> None:
     if manifest.tp_size != 1:
         raise HandoffError("hybrid handoffs are single-rank")
     tokens = manifest.prompt_tokens
-    have = {(entry.layer, entry.kind, entry.name): entry for entry in manifest.layers}
+    have = {(entry.layer, entry.kind, entry.name): entry for entry in manifest.layers if entry.kind != "mtp"}
+    mtp = {(entry.layer, entry.kind, entry.name): entry for entry in manifest.layers if entry.kind == "mtp"}
     want = geometry.expected()
+    want_mtp = geometry.expected_mtp()
+    # The MTP head's history is optional on both sides; when the model drafts with it, it must be whole.
+    if mtp and want_mtp:
+        if set(mtp) != set(want_mtp):
+            raise HandoffError(f"MTP entries differ: got {sorted(mtp)[:4]}, expected {sorted(want_mtp)}")
+        for key, shape in want_mtp.items():
+            full = tuple(tokens - 1 if size == -1 else size for size in shape)
+            if mtp[key].shape != full:
+                raise HandoffError(f"entry {key} is {list(mtp[key].shape)}, expected {list(full)}")
     if set(have) != set(want):
         missing = sorted(set(want) - set(have))[:3]
         extra = sorted(set(have) - set(want))[:3]
@@ -135,11 +179,15 @@ def check_manifest(manifest: wire.Manifest, geometry: HybridGeometry) -> None:
             raise HandoffError(f"entry {key} must be float32")
 
 
-def _tensors(mx: Any, result: PrefillResult) -> dict[tuple[int, str, str], Any]:
-    """Each entry's chunks joined in row order and viewed as its exported shape and dtype."""
+def _tensors(mx: Any, result: PrefillResult, mtp: bool = False) -> dict[tuple[int, str, str], Any]:
+    """Each entry's chunks joined in row order and viewed as its exported shape and dtype.
+
+    Backbone entries by default, the MTP head's with `mtp`."""
     grouped: dict[int, list[Chunk]] = defaultdict(list)
     entries = {}
     for chunk in result.chunks:
+        if (chunk.layer.kind == "mtp") != mtp:
+            continue
         grouped[chunk.layer.index].append(chunk)
         entries[chunk.layer.index] = chunk.layer
     out = {}
@@ -190,6 +238,39 @@ def build_caches(
         cache[3] = mx.array([context], dtype=mx.int64)
     mx.eval([array for cache in caches for array in _arrays(cache)])
     return caches
+
+
+def build_mtp(
+    mx: Any,
+    model: Any,
+    geometry: HybridGeometry,
+    result: PrefillResult,
+    end: int,
+    dtype: Any,
+) -> tuple[list[Any], Any] | None:
+    """The MTP head's cache over pairs [0, end - 1) and the pending trunk hidden of token end - 1.
+
+    None when the handoff carries no MTP history or the local model does not draft with it."""
+    if geometry.mtp_layer < 0 or end < 2:
+        return None
+    tensors = _tensors(mx, result, mtp=True)
+    layer = geometry.mtp_layer
+    if not tensors or set(tensors) != set(geometry.expected_mtp()):
+        return None
+    host = _mtp_host(model)
+    if host is None:
+        return None
+    caches = host.make_mtp_cache()
+    if len(caches) != 1:
+        raise HandoffError(f"the MTP head has {len(caches)} layers; the handoff carries one")
+    rows = end - 1
+    keys = tensors[(layer, "mtp", "k")].transpose(1, 0, 2)[None].astype(dtype)
+    values = tensors[(layer, "mtp", "v")].transpose(1, 0, 2)[None].astype(dtype)
+    index_keys = tensors[(layer, "mtp", "index_keys")][None].astype(dtype)
+    caches[0].state = (keys, values, index_keys, mx.arange(rows, dtype=mx.int32)[None])
+    hidden = tensors[(layer, "mtp", "hidden")][None].astype(dtype)  # [1, 1, hc_dim]
+    mx.eval([*_arrays(caches[0]), hidden])
+    return caches, hidden
 
 
 def _arrays(cache: Any) -> list[Any]:

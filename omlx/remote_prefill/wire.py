@@ -34,8 +34,8 @@ DIM_LABELS = frozenset(
 # "qsa" (sparse-attention keys, values and raw index keys), "gdn" (Gated DeltaNet conv
 # and recurrent state) and "ple" (the PLE layer's short-conv state). Their first
 # dimension is "block": the axis frames are cut along (tokens, conv taps or heads).
-HYBRID_KINDS = frozenset({"qsa", "gdn", "ple"})
-HYBRID_DIM_LABELS = frozenset({"head", "head_dim", "index_dim", "channel", "v_dim", "k_dim"})
+HYBRID_KINDS = frozenset({"qsa", "gdn", "ple", "mtp"})
+HYBRID_DIM_LABELS = frozenset({"head", "head_dim", "index_dim", "channel", "v_dim", "k_dim", "hidden"})
 
 
 class WireError(ValueError):

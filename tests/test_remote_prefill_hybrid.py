@@ -166,3 +166,73 @@ def test_build_caches_refuses_an_incomplete_entry():
     result = PrefillResult((manifest(entries),), tuple(missing_frame), 0, 0.0, 0.0)
     with pytest.raises(HandoffError, match="incomplete"):
         hybrid.build_caches(mx, make_cache, found, result, TOKENS, mx.bfloat16)
+
+
+MTP_MODEL = SimpleNamespace(args=CONFIG, _omlx_mtp_decode_enabled=True, _omlx_mtp_chain=True,
+                            get_mtp_module=lambda: object(), make_mtp_cache=lambda: [QSAKVCache()])
+
+
+def mtp_entries_and_chunks(start=8, rows=6, layer=3):
+    """The MTP head's entries as an MTP producer sends them: one row fewer than the prompt."""
+    spec = {
+        "k": ((rows, 2, 8), ["block", "head", "head_dim"]),
+        "v": ((rows, 2, 8), ["block", "head", "head_dim"]),
+        "index_keys": ((rows, 6), ["block", "index_dim"]),
+        "hidden": ((1, 10), ["block", "hidden"]),
+    }
+    values, entries, chunks = {}, [], []
+    for position, (name, (shape, dims)) in enumerate(spec.items(), start):
+        array = (mx.arange(int(mx.prod(mx.array(shape)).item())) + 1000 * position).reshape(shape).astype(mx.bfloat16)
+        values[name] = array
+        entry = wire.LayerExport.from_dict({"index": position, "kind": "mtp", "layer": layer, "name": name,
+                                            "shape": list(shape), "dims": dims, "dtype": "bfloat16"})
+        entries.append(entry)
+        chunks.append(Chunk(0, entry, 0, shape[0], array.view(mx.uint16).reshape(-1)))
+    return values, entries, chunks
+
+
+def test_mtp_entries_are_checked_only_when_the_model_drafts_with_its_head():
+    _, entries, _ = entries_and_chunks()
+    _, mtp, _ = mtp_entries_and_chunks()
+    plain = geometry()
+    assert plain.mtp_layer == -1
+    hybrid.check_manifest(manifest(entries + mtp), plain)  # ignored: nothing here drafts with them
+    found, reason = hybrid.hybrid_geometry(MTP_MODEL, make_cache())
+    assert found is not None, reason
+    assert found.mtp_layer == 3 and found.shapes[("mtp", "hidden")] == (1, 10)
+    hybrid.check_manifest(manifest(entries + mtp), found)
+    hybrid.check_manifest(manifest(entries), found)  # a producer without MTP sends none
+    _, whole, _ = mtp_entries_and_chunks(rows=7)
+    with pytest.raises(HandoffError, match="expected"):
+        hybrid.check_manifest(manifest(entries + whole), found)
+    with pytest.raises(HandoffError, match="MTP entries differ"):
+        hybrid.check_manifest(manifest(entries + mtp[:-1]), found)
+
+
+def test_build_mtp_gives_the_heads_history_and_the_pending_hidden_state():
+    found, _ = hybrid.hybrid_geometry(MTP_MODEL, make_cache())
+    values, entries, chunks = entries_and_chunks()
+    mtp_values, mtp, mtp_chunks = mtp_entries_and_chunks()
+    result = PrefillResult((manifest(entries + mtp),), tuple(chunks + mtp_chunks), 0, 0.0, 0.0)
+    caches = hybrid.build_caches(mx, make_cache, found, result, TOKENS, mx.bfloat16)
+    assert caches[2].state[0].shape == (1, 2, 7, 8)  # the backbone ignores the head's entries
+    head, hidden = hybrid.build_mtp(mx, MTP_MODEL, found, result, len(TOKENS), mx.bfloat16)
+    keys, vals, index_keys, positions = head[0].state
+    assert keys.shape == (1, 2, 6, 8) and mx.array_equal(keys[0], mtp_values["k"].transpose(1, 0, 2))
+    assert mx.array_equal(vals[0], mtp_values["v"].transpose(1, 0, 2))
+    assert mx.array_equal(index_keys[0], mtp_values["index_keys"])
+    assert positions.tolist() == [list(range(6))]
+    assert hidden.shape == (1, 1, 10) and mx.array_equal(hidden[0], mtp_values["hidden"])
+    plain = PrefillResult((manifest(entries),), tuple(chunks), 0, 0.0, 0.0)
+    assert hybrid.build_mtp(mx, MTP_MODEL, found, plain, len(TOKENS), mx.bfloat16) is None
+
+
+def test_the_handoffs_mtp_history_stands_in_for_the_prefix_sidecar():
+    from omlx.remote_prefill.service import _HandedOffMtp
+
+    calls = []
+    base = SimpleNamespace(block_size=16, restore_mtp_prefix_snapshot=lambda *a, **k: calls.append(a) or "sidecar")
+    snapshot = SimpleNamespace(boundary_tokens=7)
+    view = _HandedOffMtp(base, snapshot)
+    assert view.restore_mtp_prefix_snapshot(TOKENS, 7) is snapshot and not calls
+    assert view.restore_mtp_prefix_snapshot(TOKENS, 5) == "sidecar" and view.block_size == 16
